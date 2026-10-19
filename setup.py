@@ -25,6 +25,8 @@ setup(
     entry_points={
     'console_scripts': [
         'global_pose_gamepad_controller = engineai_pose_controller.global_pose_gamepad_controller:main',
+        'engineai_joint_state_to_standard = engineai_pose_controller.engineai_joint_state_to_standard:main',
+        'engineai_base_pose_to_standard = engineai_pose_controller.engineai_base_pose_to_standard:main',
     ],
 	},
 )
