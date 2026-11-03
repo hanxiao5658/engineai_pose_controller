@@ -1,11 +1,30 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""T800 simulation adapter: EngineAI BodyVelCmd -> virtual gamepad LCM.
+
+Input (identical to the vendor's body_velocity_control_example.py):
+    /motion/body_vel_cmd  interface_protocol/msg/BodyVelCmd
+      header.frame_id = "body"
+      linear_velocity  = [vx, vy]  (m/s, body frame, +x forward, +y left)
+      yaw_velocity     = wz        (rad/s, +z counterclockwise)
+
+Output (same as the previously working global_pose_gamepad_controller.py):
+    LCM channel virtual_gamepad/gamepad_keys; lcm_msgs.data.GamepadKeys
+
+The gamepad API accepts dimensionless stick commands, not physical velocities.
+The *_scale parameters are *empirical* stick-per-physical-unit gains; calibrate
+these on the simulator before relying on speed accuracy.
+
+No pose feedback or position P-control is used in this adapter.
+"""
+
+import math
 import os
 import sys
-import math
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
-# 让 Python 能找到 EngineAI 虚拟手柄使用的 lcm_msgs
+# Preserve the path and LCM channel of the original, tested controller.
 SDK_DIR = os.environ.get(
     "ENGINEAI_ROBOTICS_DIR",
     os.path.expanduser("~/workspaces/engineai_robotics_native_sdk"),
@@ -23,351 +42,223 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
     QoSDurabilityPolicy,
 )
-
-from geometry_msgs.msg import PoseStamped
-from interface_protocol.msg import LinkInfo
+from interface_protocol.msg import BodyVelCmd
 from lcm_msgs.data import GamepadKeys
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def normalize_angle(angle: float) -> float:
-    while angle > math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
-    return angle
-
-
-def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(siny_cosp, cosy_cosp)
+def clamp(value: float, bound: float) -> float:
+    limit = abs(bound)
+    return max(-limit, min(limit, value))
 
 
 class GlobalPoseGamepadController(Node):
-    """
-    Subscribe:
-      /simulation/base_link          interface_protocol/msg/LinkInfo
-      /target_pose_global_one        geometry_msgs/msg/PoseStamped
-
-    Output:
-      LCM virtual_gamepad/gamepad_keys
-    """
+    """Keep the old class / console-script name for drop-in compatibility."""
 
     def __init__(self):
         super().__init__("global_pose_gamepad_controller")
 
-        # ---------------- Parameters ----------------
-        self.declare_parameter("current_pose_topic", "/simulation/base_link")
-        self.declare_parameter("target_pose_topic", "/target_pose_global_one")
-
+        # Topic and LCM: vendor-facing topic is NOT renamed to /my_ros2/... .
+        self.declare_parameter("body_vel_topic", "/motion/body_vel_cmd")
+        self.declare_parameter("expected_frame_id", "body")
         self.declare_parameter("lcm_url", "udpm://239.255.76.67:7667?ttl=0")
         self.declare_parameter("lcm_channel", "virtual_gamepad/gamepad_keys")
 
-        self.declare_parameter("control_rate", 20.0)
+        # Vendor example publishes at 100 Hz. Forward the latest command at 100 Hz.
+        self.declare_parameter("control_rate", 100.0)
+        # Invalidate commands on loss of publisher (monotonic/wall time, not /clock).
+        self.declare_parameter("cmd_timeout", 0.3)
 
-        # P 控制增益
-        self.declare_parameter("kp_forward", 0.4)
-        self.declare_parameter("kp_lateral", 0.4)
-        self.declare_parameter("kp_yaw", 0.5)
+        # Values convert physical units to dimensionless gamepad axes:
+        # 0.5 m/s -> 0.5 on forward stick at the default 1.0 scale.
+        # These are initial calibration values, NOT an accurate speed model.
+        self.declare_parameter("forward_scale", 1.0)   # stick per (m/s)
+        self.declare_parameter("lateral_scale", 1.0)   # stick per (m/s)
+        self.declare_parameter("yaw_scale", 1.0)       # stick per (rad/s)
 
-        # 摇杆限幅
-        self.declare_parameter("max_forward", 0.9)
-        self.declare_parameter("max_lateral", 0.20)
-        self.declare_parameter("max_turn", 0.9)
-
-        # 到点阈值
-        self.declare_parameter("position_tolerance", 0.10)
-        self.declare_parameter("yaw_tolerance", 0.10)
-        self.declare_parameter("deadband", 0.03)
-
-        # 坐标/方向符号修正
-        # left_stick_x 正数：前进
-        # left_stick_y 正数：向右
-        # right_stick_y 正数：向右旋转
+        # Preserve empirically verified original axes and signs.
+        # Old LCM: left stick X +forward, left stick Y +right,
+        #          right stick Y +right turn.
+        # BodyVelCmd (usual ROS body): +x forward, +y left, +yaw left.
         self.declare_parameter("forward_sign", 1.0)
-        self.declare_parameter("lateral_sign", 1.0)
+        self.declare_parameter("lateral_sign", -1.0)
         self.declare_parameter("yaw_sign", -1.0)
 
-        # 如果一段时间没有收到目标点，是否输出 0 摇杆
-        self.declare_parameter("target_timeout", 300.0)
-
-        # debug
+        self.declare_parameter("max_forward", 0.9)
+        self.declare_parameter("max_lateral", 0.2)
+        self.declare_parameter("max_turn", 0.9)
+        self.declare_parameter("deadband", 0.03)
         self.declare_parameter("debug_print", True)
-        self.declare_parameter("debug_period", 0.2)
+        self.declare_parameter("debug_period", 1.0)
 
-        self.current_pose_topic = str(self.get_parameter("current_pose_topic").value)
-        self.target_pose_topic = str(self.get_parameter("target_pose_topic").value)
+        def param(name):
+            return self.get_parameter(name).value
 
-        self.lcm_url = str(self.get_parameter("lcm_url").value)
-        self.lcm_channel = str(self.get_parameter("lcm_channel").value)
+        self.body_vel_topic = str(param("body_vel_topic"))
+        self.expected_frame_id = str(param("expected_frame_id"))
+        self.lcm_channel = str(param("lcm_channel"))
+        self.control_rate = float(param("control_rate"))
+        self.cmd_timeout = float(param("cmd_timeout"))
+        self.forward_scale = float(param("forward_scale"))
+        self.lateral_scale = float(param("lateral_scale"))
+        self.yaw_scale = float(param("yaw_scale"))
+        self.forward_sign = float(param("forward_sign"))
+        self.lateral_sign = float(param("lateral_sign"))
+        self.yaw_sign = float(param("yaw_sign"))
+        self.max_forward = min(abs(float(param("max_forward"))), 1.0)
+        self.max_lateral = min(abs(float(param("max_lateral"))), 1.0)
+        self.max_turn = min(abs(float(param("max_turn"))), 1.0)
+        self.deadband = abs(float(param("deadband")))
+        self.debug_print = bool(param("debug_print"))
+        self.debug_period = float(param("debug_period"))
 
-        self.control_rate = float(self.get_parameter("control_rate").value)
+        if self.control_rate <= 0.0 or self.cmd_timeout <= 0.0:
+            raise ValueError("control_rate and cmd_timeout must both be > 0")
+        for name in ("forward_scale", "lateral_scale", "yaw_scale"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(name + " must be finite and nonnegative")
 
-        self.kp_forward = float(self.get_parameter("kp_forward").value)
-        self.kp_lateral = float(self.get_parameter("kp_lateral").value)
-        self.kp_yaw = float(self.get_parameter("kp_yaw").value)
+        self.last_rx_monotonic: Optional[float] = None
+        self.last_cmd: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.last_debug_monotonic = 0.0
+        self.last_warning_monotonic = 0.0
+        self.reported_timeout = False
 
-        self.max_forward = abs(float(self.get_parameter("max_forward").value))
-        self.max_lateral = abs(float(self.get_parameter("max_lateral").value))
-        self.max_turn = abs(float(self.get_parameter("max_turn").value))
+        self.lcm_handle = lcm.LCM(str(param("lcm_url")))
 
-        self.position_tolerance = float(self.get_parameter("position_tolerance").value)
-        self.yaw_tolerance = float(self.get_parameter("yaw_tolerance").value)
-        self.deadband = float(self.get_parameter("deadband").value)
-
-        self.forward_sign = float(self.get_parameter("forward_sign").value)
-        self.lateral_sign = float(self.get_parameter("lateral_sign").value)
-        self.yaw_sign = float(self.get_parameter("yaw_sign").value)
-
-        self.target_timeout = float(self.get_parameter("target_timeout").value)
-
-        self.debug_print = bool(self.get_parameter("debug_print").value)
-        self.debug_period = float(self.get_parameter("debug_period").value)
-        self.last_debug_time = 0.0
-
-        # ---------------- State ----------------
-        self.current_x: Optional[float] = None
-        self.current_y: Optional[float] = None
-        self.current_yaw: Optional[float] = None
-        self.last_current_pose_time = 0.0
-
-        self.target_x: Optional[float] = None
-        self.target_y: Optional[float] = None
-        self.target_yaw: Optional[float] = None
-        self.last_target_time = 0.0
-
-        self.reached = False
-
-        # ---------------- LCM ----------------
-        self.lcm_handle = lcm.LCM(self.lcm_url)
-
-        # ---------------- ROS2 subscriptions ----------------
-        # /simulation/base_link 是我们自己从 SDK 中桥接出来的仿真真值。
-        # 它的消息类型 LinkInfo 内部包含 header、pose、twist。
-        # 之前你遇到 QoS 不兼容，所以这里使用 BEST_EFFORT。
-        current_pose_qos = QoSProfile(
+        # BEST_EFFORT subscriber is compatible with the vendor's default RELIABLE
+        # publisher, as well as with a BEST_EFFORT publisher in some simulators.
+        qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-
-        self.current_pose_sub = self.create_subscription(
-            LinkInfo,
-            self.current_pose_topic,
-            self.current_pose_callback,
-            current_pose_qos,
+        self.sub = self.create_subscription(
+            BodyVelCmd, self.body_vel_topic, self.body_vel_callback, qos
         )
-
-        self.target_pose_sub = self.create_subscription(
-            PoseStamped,
-            self.target_pose_topic,
-            self.target_pose_callback,
-            10,
-        )
-
-        self.timer = self.create_timer(
-            1.0 / self.control_rate,
-            self.control_loop,
-        )
+        self.timer = self.create_timer(1.0 / self.control_rate, self.control_loop)
 
         self.get_logger().info(
-            f"GlobalPoseGamepadController started. "
-            f"current_pose_topic={self.current_pose_topic}, "
-            f"target_pose_topic={self.target_pose_topic}, "
-            f"lcm_channel={self.lcm_channel}"
+            "T800 BodyVelCmd -> LCM adapter started: "
+            f"subscribe={self.body_vel_topic} "
+            f"(interface_protocol/msg/BodyVelCmd); "
+            f"publish LCM={self.lcm_channel}; "
+            f"rate={self.control_rate:g}Hz; timeout={self.cmd_timeout:g}s"
         )
-
-    def current_pose_callback(self, msg: LinkInfo):
-        self.current_x = msg.pose.position.x
-        self.current_y = msg.pose.position.y
-
-        q = msg.pose.orientation
-        self.current_yaw = yaw_from_quaternion(q.x, q.y, q.z, q.w)
-
-        self.last_current_pose_time = time.time()
-
-    def target_pose_callback(self, msg: PoseStamped):
-        self.target_x = msg.pose.position.x
-        self.target_y = msg.pose.position.y
-
-        q = msg.pose.orientation
-        self.target_yaw = yaw_from_quaternion(q.x, q.y, q.z, q.w)
-
-        self.last_target_time = time.time()
-        self.reached = False
-
-        self.get_logger().info(
-            f"Received new target: "
-            f"x={self.target_x:.3f}, y={self.target_y:.3f}, yaw={self.target_yaw:.3f} rad, "
-            f"frame_id={msg.header.frame_id}"
-        )
-
-    def debug_log(self, text: str):
-        if not self.debug_print:
-            return
-
-        now = time.time()
-        if now - self.last_debug_time < self.debug_period:
-            return
-
-        self.last_debug_time = now
-        self.get_logger().info(text)
-
-    def apply_deadband(self, value: float) -> float:
-        if abs(value) < self.deadband:
-            return 0.0
-        return value
-
-    def make_gamepad_msg(
-        self,
-        left_stick_x: float = 0.0,
-        left_stick_y: float = 0.0,
-        right_stick_y: float = 0.0,
-    ) -> GamepadKeys:
-        msg = GamepadKeys()
-        msg.timestamp = int(time.time() * 1_000_000)
-
-        msg.digital_states = [0] * 12
-        msg.analog_states = [0.0] * 6
-
-        # analog_states:
-        # 0 LT
-        # 1 RT
-        # 2 Left Stick X:  前后，正数前进
-        # 3 Left Stick Y:  左右，正数向右
-        # 4 Right Stick X
-        # 5 Right Stick Y: 转向，正数右转
-        msg.analog_states[2] = float(left_stick_x)
-        msg.analog_states[3] = float(left_stick_y)
-        msg.analog_states[5] = float(right_stick_y)
-
-        return msg
-
-    def publish_gamepad(
-        self,
-        left_stick_x: float = 0.0,
-        left_stick_y: float = 0.0,
-        right_stick_y: float = 0.0,
-    ):
-        msg = self.make_gamepad_msg(
-            left_stick_x=left_stick_x,
-            left_stick_y=left_stick_y,
-            right_stick_y=right_stick_y,
-        )
-        self.lcm_handle.publish(self.lcm_channel, msg.encode())
-
-    def publish_zero(self, reason: str):
         self.publish_gamepad(0.0, 0.0, 0.0)
-        self.debug_log(
-            f"{reason} | joystick: LX_forward=0.000, LY_right=0.000, RY_turn_right=0.000"
-        )
 
-    def control_loop(self):
-        now = time.time()
+    def warning_throttled(self, message: str):
+        now = time.monotonic()
+        if now - self.last_warning_monotonic >= 2.0:
+            self.get_logger().warning(message)
+            self.last_warning_monotonic = now
 
-        if self.current_x is None or self.current_y is None or self.current_yaw is None:
-            self.publish_zero("No current pose received")
-            return
-
-        if self.target_x is None or self.target_y is None or self.target_yaw is None:
-            self.publish_zero("No target pose received")
-            return
-
-        if now - self.last_target_time > self.target_timeout:
-            self.publish_zero(
-                f"Target timeout: last target {now - self.last_target_time:.2f}s ago"
+    def body_vel_callback(self, msg: BodyVelCmd):
+        frame = str(msg.header.frame_id)
+        if self.expected_frame_id and frame != self.expected_frame_id:
+            self.last_rx_monotonic = None
+            self.last_cmd = (0.0, 0.0, 0.0)
+            self.warning_throttled(
+                f"Rejected command frame_id={frame!r}; expected {self.expected_frame_id!r}"
             )
             return
 
-        dx = self.target_x - self.current_x
-        dy = self.target_y - self.current_y
-        distance = math.hypot(dx, dy)
-
-        yaw = self.current_yaw
-        yaw_error = normalize_angle(self.target_yaw - yaw)
-
-        # 世界坐标误差转到机器人机体系。
-        # body_forward > 0：目标在机器人前方
-        # body_left > 0：目标在机器人左侧
-        body_forward = math.cos(yaw) * dx + math.sin(yaw) * dy
-        body_left = -math.sin(yaw) * dx + math.cos(yaw) * dy
-
-        # 你的测试结论：Left Stick Y 正数让机器人向右移动
-        body_right = -body_left
-
-        if distance < self.position_tolerance:
-            forward_cmd = 0.0
-            lateral_cmd = 0.0
-        else:
-            forward_cmd = self.forward_sign * self.kp_forward * body_forward
-            lateral_cmd = self.lateral_sign * self.kp_lateral * body_right
-
-        if abs(yaw_error) < self.yaw_tolerance:
-            turn_cmd = 0.0
-        else:
-            turn_cmd = self.yaw_sign * self.kp_yaw * yaw_error
-
-        forward_cmd = clamp(forward_cmd, -self.max_forward, self.max_forward)
-        lateral_cmd = clamp(lateral_cmd, -self.max_lateral, self.max_lateral)
-        turn_cmd = clamp(turn_cmd, -self.max_turn, self.max_turn)
-
-        forward_cmd = self.apply_deadband(forward_cmd)
-        lateral_cmd = self.apply_deadband(lateral_cmd)
-        turn_cmd = self.apply_deadband(turn_cmd)
-
-        if distance < self.position_tolerance and abs(yaw_error) < self.yaw_tolerance:
-            self.publish_gamepad(0.0, 0.0, 0.0)
-
-            if not self.reached:
-                self.get_logger().info(
-                    f"Target reached. "
-                    f"current=({self.current_x:.3f}, {self.current_y:.3f}, {self.current_yaw:.3f}), "
-                    f"target=({self.target_x:.3f}, {self.target_y:.3f}, {self.target_yaw:.3f}), "
-                    f"distance={distance:.3f}, yaw_error={yaw_error:.3f}"
-                )
-                self.reached = True
-
+        if len(msg.linear_velocity) != 2:
+            self.last_rx_monotonic = None
+            self.last_cmd = (0.0, 0.0, 0.0)
+            self.warning_throttled("Rejected command: linear_velocity must have 2 entries")
             return
 
-        self.reached = False
+        vx = float(msg.linear_velocity[0])
+        vy = float(msg.linear_velocity[1])
+        wz = float(msg.yaw_velocity)
+        if not all(math.isfinite(v) for v in (vx, vy, wz)):
+            self.last_rx_monotonic = None
+            self.last_cmd = (0.0, 0.0, 0.0)
+            self.warning_throttled("Rejected command: non-finite velocity")
+            return
 
-        self.publish_gamepad(
-            left_stick_x=forward_cmd,
-            left_stick_y=lateral_cmd,
-            right_stick_y=turn_cmd,
+        self.last_cmd = (vx, vy, wz)
+        self.last_rx_monotonic = time.monotonic()
+        self.reported_timeout = False
+
+    def deadband_axis(self, value: float) -> float:
+        return 0.0 if abs(value) < self.deadband else value
+
+    def convert_to_sticks(self, vx: float, vy: float, wz: float) -> Tuple[float, float, float]:
+        return (
+            self.deadband_axis(clamp(self.forward_sign * self.forward_scale * vx, self.max_forward)),
+            self.deadband_axis(clamp(self.lateral_sign * self.lateral_scale * vy, self.max_lateral)),
+            self.deadband_axis(clamp(self.yaw_sign * self.yaw_scale * wz, self.max_turn)),
         )
 
-        self.debug_log(
-            f"target=({self.target_x:.2f}, {self.target_y:.2f}, {self.target_yaw:.2f}) | "
-            f"current=({self.current_x:.2f}, {self.current_y:.2f}, {self.current_yaw:.2f}) | "
-            f"distance={distance:.3f}, yaw_error={yaw_error:.3f} | "
-            f"body_error: forward={body_forward:.3f}, right={body_right:.3f} | "
-            f"joystick: LX_forward={forward_cmd:.3f}, "
-            f"LY_right={lateral_cmd:.3f}, "
-            f"RY_turn_right={turn_cmd:.3f}"
+    def publish_gamepad(self, left_stick_x: float, left_stick_y: float,
+                        right_stick_y: float):
+        # Preserve the original LCM GamepadKeys byte schema exactly.
+        msg = GamepadKeys()
+        msg.timestamp = int(time.time() * 1_000_000)
+        msg.digital_states = [0] * 12
+        msg.analog_states = [0.0] * 6
+        msg.analog_states[2] = float(left_stick_x)
+        msg.analog_states[3] = float(left_stick_y)
+        msg.analog_states[5] = float(right_stick_y)
+        self.lcm_handle.publish(self.lcm_channel, msg.encode())
+
+    def control_loop(self):
+        now = time.monotonic()
+        fresh = (
+            self.last_rx_monotonic is not None
+            #and now - self.last_rx_monotonic <= self.cmd_timeout
         )
+        if fresh:
+            vx, vy, wz = self.last_cmd
+            sticks = self.convert_to_sticks(vx, vy, wz)
+        else:
+            sticks = (0.0, 0.0, 0.0)
+            if self.last_rx_monotonic is not None and not self.reported_timeout:
+                self.get_logger().warning(
+                    f"No new BodyVelCmd for {self.cmd_timeout:.2f}s: publishing neutral sticks"
+                )
+                self.reported_timeout = True
+
+        self.publish_gamepad(*sticks)
+        if self.debug_print and now - self.last_debug_monotonic >= self.debug_period:
+            self.last_debug_monotonic = now
+            if fresh:
+                self.get_logger().info(
+                    "BodyVelCmd body(m/s,rad/s): "
+                    f"vx={vx:+.3f} vy={vy:+.3f} wz={wz:+.3f} -> "
+                    f"LCM sticks: LX={sticks[0]:+.3f} LY={sticks[1]:+.3f} "
+                    f"RY={sticks[2]:+.3f}"
+                )
+            else:
+                self.get_logger().info("Waiting for BodyVelCmd; sending neutral sticks")
+
+    def stop(self):
+        # Best-effort neutral command at program exit; not a physical E-stop.
+        for _ in range(3):
+            try:
+                self.publish_gamepad(0.0, 0.0, 0.0)
+            except Exception:
+                break
+            time.sleep(0.01)
 
 
-def main():
-    print("running this 22222 !!!!")
-    rclpy.init()
-    node = GlobalPoseGamepadController()
-
+def main(args=None):
+    rclpy.init(args=args)
+    node = None
     try:
+        node = GlobalPoseGamepadController()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.publish_gamepad(0.0, 0.0, 0.0)
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.stop()
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
-    print("running this one !!!!")
     main()
