@@ -35,6 +35,7 @@ setup(
         'engineai_joint_state_to_standard = engineai_pose_controller.engineai_joint_state_to_standard:main',
         'engineai_base_pose_to_standard = engineai_pose_controller.engineai_base_pose_to_standard:main',
         'body_vel_twist_to_vendor = engineai_pose_controller.body_vel_twist_to_vendor:main',
+        'test_gamepad_keys_keyboard_mouse = engineai_pose_controller.test_gamepad_keys_keyboard_mouse:main',
     ],
 	},
 )

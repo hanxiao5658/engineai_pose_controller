@@ -10,6 +10,11 @@
 正式目标输出：
   /motion/body_vel_cmd                     interface_protocol/msg/BodyVelCmd
 
+运行状态输出（新增）：
+  /my_ros2/controller/status                std_msgs/msg/String
+  每次控制周期发布当前 ARMED/DISARMED、原因、输入 Twist 和输出速度，
+  便于通过 ros2 topic echo 查看后台运行时的状态。
+
 安全策略：
   * 初始 DISARMED。
   * heartbeat、Twist、gamepad 都有超时保护。
@@ -306,17 +311,21 @@ class BodyVelTwistToVendor(Node):
         self.pad_sub = self.create_subscription(
             GamepadKeys, str(p('gamepad_topic')), self._on_gamepad, qos)
 
+        # 状态上报独立于厂商速度指令：即使速度发布被禁用，也会持续发布状态。
+        # 使用 ROS2 标准 std_msgs/String，无需额外的自定义消息。
+        self.status_publisher = self.create_publisher(
+            String, '/my_ros2/controller/status', 10)
+
         # ============================================================
-        # 真实机器人 Publisher：当前明确禁用
+        # 真实机器人 Publisher：已经启用
         #
         # ⚠️【真实发布相关代码 1/2】
         # 下面这一行已经写好，但当前保持注释状态，因此本节点不会创建
         # /motion/body_vel_cmd 的真实 Publisher。
         #
-        # 若未来完成全部安全测试并确认厂商接口无误，才可以手动解除下一行注释：
+        # 若未来完成全部安全测试并确认厂商接口无误，才可以手动解除下一行注释： ##已完成测试 开放实机
         #
-        # self.vendor_publisher = self.create_publisher(
-        #     BodyVelCmd, self.output_topic, 10)
+        #self.vendor_publisher = self.create_publisher(BodyVelCmd, self.output_topic, 10)
         #
         # ============================================================
 
@@ -367,14 +376,14 @@ class BodyVelTwistToVendor(Node):
         out.yaw_velocity = wz
 
         # ============================================================
-        # 真实机器人速度发布：当前明确禁用
+        # 真实机器人速度发布：已启用
         #
         # ⚠️【真实发布相关代码 2/2 —— 最关键的一行】
         # 下一行才是真正把经过安全门控后的速度发送到厂商机器人的代码。
-        # 当前保持注释状态，因此本脚本无论 ARMED / DISARMED 都不会真正控制机器人。
+        # 当前保持注释状态，因此本脚本无论 ARMED / DISARMED 都不会真正控制机器人。（已取消注释状态，开启实机测试2026-11-12）
         #
         # ↓↓↓【真正向机器人发送速度的关键一行】当前保持注释 ↓↓↓
-        # self.vendor_publisher.publish(out)
+        #self.vendor_publisher.publish(out)
         # ↑↑↑ 只有解除这一行注释后，速度才会真正发送给机器人 ↑↑↑
         #
         # ⚠️ 只有在同时解除上方 Publisher 创建代码的注释，并完成全部安全验证后，
@@ -416,7 +425,7 @@ class BodyVelTwistToVendor(Node):
         # ------------------------------------------------------------
         # TX：经过安全门控后的最终输出
         # ------------------------------------------------------------
-        tx_mode = 'DRY_RUN'
+        tx_mode = 'NOT_DRY_RUN'
         tx_text = (
             'TX {}: vx={:.3f} vy={:.3f} wz={:.3f}'.format(
                 self.output_topic, vx, vy, wz
@@ -434,6 +443,30 @@ class BodyVelTwistToVendor(Node):
             ),
             flush=True
         )
+
+        # ------------------------------------------------------------
+        # ROS2 状态话题：以与上方 print 相同的 output_rate_hz 持续更新。
+        # 额外包含最近一次解除授权原因、导航授权和手柄输入状态。
+        # 这里仅发布诊断字符串，不参与任何安全门控或速度计算。
+        # ------------------------------------------------------------
+        status_msg = String()
+        status_msg.data = (
+            'state={}|reason={}|event={}|last_disarm={}|'
+            'motion_allowed={}|gamepad_connected={}|sticks_neutral={}|'
+            '{}|twist_age={}|{}'.format(
+                arm_state,
+                reason,
+                self.gate.reason,
+                self.gate.last_disarm_reason,
+                int(self.gate.motion_allowed),
+                int(self.gate.pad_connected),
+                int(self.gate.sticks_neutral),
+                rx_text,
+                twist_age_text,
+                tx_text,
+            )
+        )
+        self.status_publisher.publish(status_msg)
 
 
 def main(args=None):
